@@ -8,6 +8,7 @@ import (
 	"net/url"
 	"os"
 	"os/exec"
+	osUser "os/user"
 	"path/filepath"
 	"regexp"
 	"strings"
@@ -15,6 +16,7 @@ import (
 
 	"crypto/tls"
 
+	"code.google.com/p/go-netrc/netrc"
 	"code.google.com/p/goauth2/oauth"
 	"github.com/daviddengcn/go-colortext"
 	"github.com/google/go-github/github"
@@ -57,14 +59,6 @@ func die(message string) {
 	os.Exit(1)
 }
 
-var rxDiagParts = map[string]*regexp.Regexp{}
-
-func init() {
-	for _, key := range []string{"hostandport", "path"} {
-		rxDiagParts[key] = regexp.MustCompile(`^Diag: ` + key + `=(.+)`)
-	}
-}
-
 func normalizeURL(urlString string) (*url.URL, error) {
 	reScheme := regexp.MustCompile(`^[\w+]+://`)
 
@@ -86,8 +80,10 @@ type programCache struct {
 }
 
 func main() {
-	useCache := flag.Bool("cached", false, "Output cached status")
-	updateCache := flag.Bool("update", false, "Force fetch status")
+	var (
+		useCache    = flag.Bool("cached", false, "Output cached status")
+		updateCache = flag.Bool("update", false, "Force fetch status")
+	)
 
 	flag.Parse()
 
@@ -115,13 +111,13 @@ func main() {
 
 	cachedStatus := cache.Revisions[rev]
 
-	expSecs := cacheExpirationSeconds[cachedStatus.Status]
-	if expSecs == -1 || time.Now().Unix() < cachedStatus.LastModified+expSecs {
-		*useCache = true
-	}
-
 	if *updateCache {
 		*useCache = false
+	} else {
+		expSecs := cacheExpirationSeconds[cachedStatus.Status]
+		if expSecs == -1 || time.Now().Unix() < cachedStatus.LastModified+expSecs {
+			*useCache = true
+		}
 	}
 
 	if *useCache {
@@ -143,7 +139,34 @@ func main() {
 	user := parts[1]
 	repo := parts[2]
 
-	token := runGit("config", "--get-urlmatch", "github.token", remoteURL.String())
+	var token string
+
+	// try environment variable
+	token = os.Getenv("GITHUB_COMMIT_STATUS_MARK_TOKEN")
+
+	// ..then .netrc
+	if token == "" {
+		if user, _ := osUser.Current(); user != nil {
+			netrcFile := filepath.Join(user.HomeDir, ".netrc")
+			if fi, _ := os.Stat(netrcFile); fi != nil {
+				apiHost := remoteURL.Host
+				if apiHost == "github.com" {
+					apiHost = "api.github.com"
+				}
+
+				machine, _ := netrc.FindMachine(netrcFile, apiHost)
+				// ignore "default" machine
+				if machine != nil && machine.Name != "" {
+					token = machine.Password
+				}
+			}
+		}
+	}
+
+	// ..then git config
+	if token == "" {
+		token = runGit("config", "--get-urlmatch", "github.token", remoteURL.String())
+	}
 
 	// Setup client
 	var httpClient *http.Client
@@ -155,8 +178,8 @@ func main() {
 		httpClient = t.Client()
 	}
 
+	// Handle GitHub:Enterprise domains
 	if remoteURL.Host != "github.com" {
-		// XXX
 		t := http.DefaultTransport.(*http.Transport)
 		t.TLSClientConfig = &tls.Config{
 			InsecureSkipVerify: true,
