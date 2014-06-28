@@ -70,30 +70,17 @@ func normalizeURL(urlString string) (*url.URL, error) {
 	return url.Parse(strings.TrimSuffix(urlString, ".git"))
 }
 
-type programCacheStatus struct {
-	Status       string
-	LastModified int64
-}
-
-type programCache struct {
-	Revisions map[string]programCacheStatus
-}
-
-func main() {
-	var (
-		useCache    = flag.Bool("cached", false, "Output cached status")
-		updateCache = flag.Bool("update", false, "Force fetch status")
-	)
-
-	flag.Parse()
-
-	// Obtain specified revision (or HEAD)
+func targetRevision(args []string) string {
 	rev := "HEAD"
-	if len(flag.Args()) >= 1 {
-		rev = flag.Arg(0)
+	if len(args) >= 1 {
+		rev = args[0]
 	}
 	rev = runGit("rev-parse", rev)
 
+	return rev
+}
+
+func restoreCache() (programCache, *os.File) {
 	var cache programCache
 
 	// Open cache file under .github-commit-status dir
@@ -108,6 +95,71 @@ func main() {
 	}
 
 	json.NewDecoder(cacheFile).Decode(&cache)
+
+	return cache, cacheFile
+}
+
+func storeCache(cache programCache, cacheFile *os.File) {
+	cacheFile.Truncate(0)
+	cacheFile.Seek(0, os.SEEK_SET)
+	err := json.NewEncoder(cacheFile).Encode(&cache)
+	if err != nil {
+		die(err.Error())
+	}
+}
+
+func retrieveAPIToken(remoteURL *url.URL) string {
+	var token string
+
+	// try environment variable
+	token = os.Getenv("GITHUB_COMMIT_STATUS_MARK_TOKEN")
+
+	// ..then .netrc
+	if token == "" {
+		if user, _ := osUser.Current(); user != nil {
+			netrcFile := filepath.Join(user.HomeDir, ".netrc")
+			if fi, _ := os.Stat(netrcFile); fi != nil {
+				apiHost := remoteURL.Host
+				if apiHost == "github.com" {
+					apiHost = "api.github.com"
+				}
+
+				machine, _ := netrc.FindMachine(netrcFile, apiHost)
+				// ignore "default" machine
+				if machine != nil && machine.Name != "" {
+					token = machine.Password
+				}
+			}
+		}
+	}
+
+	// ..then git config
+	if token == "" {
+		token = runGit("config", "--get-urlmatch", "github.token", remoteURL.String())
+	}
+
+	return token
+}
+
+type programCacheStatus struct {
+	Status       string
+	LastModified int64
+}
+
+type programCache struct {
+	Revisions map[string]programCacheStatus
+}
+
+func main() {
+	var (
+		useCache    = flag.Bool("cached", false, "Output cached status")
+		updateCache = flag.Bool("update", false, "Force fetch status")
+	)
+	flag.Parse()
+
+	rev := targetRevision(flag.Args())
+
+	cache, cacheFile := restoreCache()
 
 	cachedStatus := cache.Revisions[rev]
 
@@ -139,38 +191,10 @@ func main() {
 	user := parts[1]
 	repo := parts[2]
 
-	var token string
-
-	// try environment variable
-	token = os.Getenv("GITHUB_COMMIT_STATUS_MARK_TOKEN")
-
-	// ..then .netrc
-	if token == "" {
-		if user, _ := osUser.Current(); user != nil {
-			netrcFile := filepath.Join(user.HomeDir, ".netrc")
-			if fi, _ := os.Stat(netrcFile); fi != nil {
-				apiHost := remoteURL.Host
-				if apiHost == "github.com" {
-					apiHost = "api.github.com"
-				}
-
-				machine, _ := netrc.FindMachine(netrcFile, apiHost)
-				// ignore "default" machine
-				if machine != nil && machine.Name != "" {
-					token = machine.Password
-				}
-			}
-		}
-	}
-
-	// ..then git config
-	if token == "" {
-		token = runGit("config", "--get-urlmatch", "github.token", remoteURL.String())
-	}
-
 	// Setup client
 	var httpClient *http.Client
 
+	token := retrieveAPIToken(remoteURL)
 	if token != "" {
 		t := &oauth.Transport{
 			Token: &oauth.Token{AccessToken: token},
@@ -217,12 +241,7 @@ func main() {
 	}
 	cache.Revisions[rev] = thisStatus
 
-	cacheFile.Truncate(0)
-	cacheFile.Seek(0, os.SEEK_SET)
-	err = json.NewEncoder(cacheFile).Encode(&cache)
-	if err != nil {
-		die(err.Error())
-	}
+	storeCache(cache, cacheFile)
 }
 
 func printStatus(status string) {
