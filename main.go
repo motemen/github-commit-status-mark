@@ -42,85 +42,15 @@ var statusConfiguration = map[string]struct {
 	statusSuccess: {"✓", ct.Green, forever},
 }
 
-func runGit(command ...string) string {
-	cmd := exec.Command("git", command...)
-	cmd.Stderr = os.Stderr
-
-	buf, err := cmd.Output()
-	if err != nil {
-		die(fmt.Sprintf("'git %s' failed: %s", strings.Join(command, " "), err))
+func printStatus(status string) {
+	conf, ok := statusConfiguration[status]
+	if !ok {
+		conf = statusConfiguration[statusUnknown]
 	}
 
-	return strings.TrimRight(string(buf), "\n")
-}
-
-func die(message string) {
-	fmt.Fprintln(os.Stderr, message)
-	os.Exit(1)
-}
-
-func dieIf(err error) {
-	if err != nil {
-		die(err.Error())
-	}
-}
-
-func normalizeURL(urlString string) (*url.URL, error) {
-	reScheme := regexp.MustCompile(`^[\w+]+://`)
-
-	urlString = reScheme.ReplaceAllLiteralString(urlString, "https://")
-	if strings.HasPrefix(urlString, "https://") == false {
-		urlString = "https://" + strings.Replace(urlString, ":", "/", 1)
-	}
-
-	return url.Parse(strings.TrimSuffix(urlString, ".git"))
-}
-
-func targetRevision(args []string) string {
-	rev := "HEAD"
-	if len(args) >= 1 {
-		rev = args[0]
-	}
-	rev = runGit("rev-parse", rev)
-
-	return rev
-}
-
-func restoreState() persistentState {
-	var state persistentState
-
-	cacheFilePath := filepath.Join(
-		runGit("rev-parse", "--show-toplevel"),
-		".github-commit-status",
-		"cache",
-	)
-
-	cacheFile, err := os.Open(cacheFilePath)
-	if err == nil {
-		json.NewDecoder(cacheFile).Decode(&state)
-	} else {
-		if os.IsNotExist(err) {
-			// ok
-		} else {
-			die(err.Error())
-		}
-	}
-
-	return state
-}
-
-func saveState(state persistentState) {
-	cacheFilePath := filepath.Join(
-		runGit("rev-parse", "--show-toplevel"),
-		".github-commit-status",
-		"cache",
-	)
-
-	cacheFile, err := os.Create(cacheFilePath)
-	dieIf(err)
-
-	err = json.NewEncoder(cacheFile).Encode(&state)
-	dieIf(err)
+	ct.ChangeColor(conf.color, false, ct.None, false)
+	fmt.Print(conf.mark)
+	ct.ResetColor()
 }
 
 func retrieveAPIToken(remoteURL *url.URL) string {
@@ -150,10 +80,15 @@ func retrieveAPIToken(remoteURL *url.URL) string {
 
 	// ..then git config
 	if token == "" {
-		token = runGit("config", "--get-urlmatch", "github.token", remoteURL.String())
+		token = runGit("config", "--get-urlmatch", "github-commit-status.token", remoteURL.String())
 	}
 
 	return token
+}
+
+type persistentState struct {
+	Revisions map[string]revisionEntry
+	path      string
 }
 
 type revisionEntry struct {
@@ -161,8 +96,79 @@ type revisionEntry struct {
 	LastModified int64
 }
 
-type persistentState struct {
-	Revisions map[string]revisionEntry
+func (state *persistentState) restore() error {
+	cacheFile, err := os.Open(state.path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			// ok
+		} else {
+			return err
+		}
+	}
+
+	json.NewDecoder(cacheFile).Decode(state)
+
+	return nil
+}
+
+func (state *persistentState) save() error {
+	cacheDir, _ := filepath.Split(state.path)
+
+	err := os.MkdirAll(cacheDir, 0777)
+	if err != nil {
+		return err
+	}
+
+	cacheFile, err := os.Create(state.path)
+	if err != nil {
+		return err
+	}
+
+	return json.NewEncoder(cacheFile).Encode(state)
+}
+
+func normalizeURL(urlString string) (*url.URL, error) {
+	reScheme := regexp.MustCompile(`^[\w+]+://`)
+
+	urlString = reScheme.ReplaceAllLiteralString(urlString, "https://")
+	if strings.HasPrefix(urlString, "https://") == false {
+		urlString = "https://" + strings.Replace(urlString, ":", "/", 1)
+	}
+
+	return url.Parse(strings.TrimSuffix(urlString, ".git"))
+}
+
+func targetRevision(args []string) string {
+	rev := "HEAD"
+	if len(args) >= 1 {
+		rev = args[0]
+	}
+	rev = runGit("rev-parse", rev)
+
+	return rev
+}
+
+func runGit(command ...string) string {
+	cmd := exec.Command("git", command...)
+	cmd.Stderr = os.Stderr
+
+	buf, err := cmd.Output()
+	if err != nil {
+		die(fmt.Sprintf("'git %s' failed: %s", strings.Join(command, " "), err))
+	}
+
+	return strings.TrimRight(string(buf), "\n")
+}
+
+func die(message string) {
+	fmt.Fprintln(os.Stderr, message)
+	os.Exit(1)
+}
+
+func dieIf(err error) {
+	if err != nil {
+		die(err.Error())
+	}
 }
 
 func main() {
@@ -172,9 +178,16 @@ func main() {
 	)
 	flag.Parse()
 
-	rev := targetRevision(flag.Args())
+	var state = persistentState{
+		path: filepath.Join(
+			runGit("rev-parse", "--show-toplevel"),
+			".github-commit-status",
+			"cache",
+		),
+	}
+	dieIf(state.restore())
 
-	state := restoreState()
+	rev := targetRevision(flag.Args())
 
 	cachedRevisionEntry := state.Revisions[rev]
 
@@ -245,7 +258,7 @@ func main() {
 	}
 
 	thisStatus := revisionEntry{
-		Status:       "",
+		Status:       statusUnknown,
 		LastModified: time.Now().Unix(),
 	}
 
@@ -260,16 +273,5 @@ func main() {
 	}
 	state.Revisions[rev] = thisStatus
 
-	saveState(state)
-}
-
-func printStatus(status string) {
-	conf, ok := statusConfiguration[status]
-	if !ok {
-		conf = statusConfiguration[statusUnknown]
-	}
-
-	ct.ChangeColor(conf.color, false, ct.None, false)
-	fmt.Print(conf.mark)
-	ct.ResetColor()
+	dieIf(state.save())
 }
