@@ -23,23 +23,23 @@ import (
 )
 
 const (
-	markUnknown = "?"
-	markFailure = "✗"
-	markPending = "●"
-	markSuccess = "✓"
+	statusUnknown = ""
+	statusFailure = "failure"
+	statusPending = "pending"
+	statusSuccess = "success"
 )
 
-var statusColors = map[string]ct.Color{
-	markFailure: ct.Red,
-	markPending: ct.Yellow,
-	markSuccess: ct.Green,
-}
+const forever = time.Duration(-1)
 
-var cacheExpirationSeconds = map[string]int64{
-	"":        30,
-	"failure": -1, // forever
-	"pending": 10,
-	"success": -1, // forever
+var statusConfiguration = map[string]struct {
+	mark     string
+	color    ct.Color
+	cacheFor time.Duration
+}{
+	statusUnknown: {"?", ct.None, 30 * time.Second},
+	statusFailure: {"✗", ct.Red, forever},
+	statusPending: {"●", ct.Yellow, 10 * time.Second},
+	statusSuccess: {"✓", ct.Green, forever},
 }
 
 func runGit(command ...string) string {
@@ -57,6 +57,12 @@ func runGit(command ...string) string {
 func die(message string) {
 	fmt.Fprintln(os.Stderr, message)
 	os.Exit(1)
+}
+
+func dieIf(err error) {
+	if err != nil {
+		die(err.Error())
+	}
 }
 
 func normalizeURL(urlString string) (*url.URL, error) {
@@ -80,32 +86,41 @@ func targetRevision(args []string) string {
 	return rev
 }
 
-func restoreCache() (programCache, *os.File) {
-	var cache programCache
+func restoreState() persistentState {
+	var state persistentState
 
-	// Open cache file under .github-commit-status dir
 	cacheFilePath := filepath.Join(
 		runGit("rev-parse", "--show-toplevel"),
 		".github-commit-status",
 		"cache",
 	)
-	cacheFile, err := os.OpenFile(cacheFilePath, os.O_CREATE|os.O_RDWR, 0666)
-	if err != nil {
-		die(err.Error())
+
+	cacheFile, err := os.Open(cacheFilePath)
+	if err == nil {
+		json.NewDecoder(cacheFile).Decode(&state)
+	} else {
+		if os.IsNotExist(err) {
+			// ok
+		} else {
+			die(err.Error())
+		}
 	}
 
-	json.NewDecoder(cacheFile).Decode(&cache)
-
-	return cache, cacheFile
+	return state
 }
 
-func storeCache(cache programCache, cacheFile *os.File) {
-	cacheFile.Truncate(0)
-	cacheFile.Seek(0, os.SEEK_SET)
-	err := json.NewEncoder(cacheFile).Encode(&cache)
-	if err != nil {
-		die(err.Error())
-	}
+func saveState(state persistentState) {
+	cacheFilePath := filepath.Join(
+		runGit("rev-parse", "--show-toplevel"),
+		".github-commit-status",
+		"cache",
+	)
+
+	cacheFile, err := os.Create(cacheFilePath)
+	dieIf(err)
+
+	err = json.NewEncoder(cacheFile).Encode(&state)
+	dieIf(err)
 }
 
 func retrieveAPIToken(remoteURL *url.URL) string {
@@ -141,13 +156,13 @@ func retrieveAPIToken(remoteURL *url.URL) string {
 	return token
 }
 
-type programCacheStatus struct {
+type revisionEntry struct {
 	Status       string
 	LastModified int64
 }
 
-type programCache struct {
-	Revisions map[string]programCacheStatus
+type persistentState struct {
+	Revisions map[string]revisionEntry
 }
 
 func main() {
@@ -159,21 +174,26 @@ func main() {
 
 	rev := targetRevision(flag.Args())
 
-	cache, cacheFile := restoreCache()
+	state := restoreState()
 
-	cachedStatus := cache.Revisions[rev]
+	cachedRevisionEntry := state.Revisions[rev]
+
+	conf, ok := statusConfiguration[cachedRevisionEntry.Status]
+	if !ok {
+		conf = statusConfiguration[statusUnknown]
+	}
 
 	if *updateCache {
 		*useCache = false
 	} else {
-		expSecs := cacheExpirationSeconds[cachedStatus.Status]
-		if expSecs == -1 || time.Now().Unix() < cachedStatus.LastModified+expSecs {
+		exp := conf.cacheFor
+		if exp == forever || time.Now().Before(time.Unix(cachedRevisionEntry.LastModified, 0).Add(exp)) {
 			*useCache = true
 		}
 	}
 
 	if *useCache {
-		printStatus(cachedStatus.Status)
+		printStatus(cachedRevisionEntry.Status)
 		os.Exit(0)
 	}
 
@@ -214,9 +234,8 @@ func main() {
 
 	if remoteURL.Host != "github.com" {
 		u, err := url.Parse(fmt.Sprintf("https://%s/api/v3/", remoteURL.Host))
-		if err != nil {
-			die(err.Error())
-		}
+		dieIf(err)
+
 		client.BaseURL = u
 	}
 
@@ -225,7 +244,7 @@ func main() {
 		die(fmt.Sprintf("Error while fetching status: %s", err))
 	}
 
-	thisStatus := programCacheStatus{
+	thisStatus := revisionEntry{
 		Status:       "",
 		LastModified: time.Now().Unix(),
 	}
@@ -236,31 +255,21 @@ func main() {
 
 	printStatus(thisStatus.Status)
 
-	if cache.Revisions == nil {
-		cache.Revisions = map[string]programCacheStatus{}
+	if state.Revisions == nil {
+		state.Revisions = map[string]revisionEntry{}
 	}
-	cache.Revisions[rev] = thisStatus
+	state.Revisions[rev] = thisStatus
 
-	storeCache(cache, cacheFile)
+	saveState(state)
 }
 
 func printStatus(status string) {
-	mark := markUnknown
-
-	switch status {
-	case "failure":
-		mark = markFailure
-	case "pending":
-		mark = markPending
-	case "success":
-		mark = markSuccess
+	conf, ok := statusConfiguration[status]
+	if !ok {
+		conf = statusConfiguration[statusUnknown]
 	}
 
-	if color, ok := statusColors[mark]; ok {
-		ct.ChangeColor(color, false, ct.None, false)
-		fmt.Print(mark)
-		ct.ResetColor()
-	} else {
-		fmt.Print(mark)
-	}
+	ct.ChangeColor(conf.color, false, ct.None, false)
+	fmt.Print(conf.mark)
+	ct.ResetColor()
 }
